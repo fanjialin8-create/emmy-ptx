@@ -1,0 +1,27 @@
+# second wave: dtypes, odd shapes, masks, alternate formulations
+p_half_add|torch.randn(1,256,dtype=torch.float16)+torch.randn(1,256,dtype=torch.float16)
+p_half_relu|torch.relu(torch.randn(1,512,dtype=torch.float16))
+p_half_mul|torch.randn(2,64,dtype=torch.float16)*3.0
+p_bf16_add|torch.randn(1,128,dtype=torch.bfloat16)+torch.randn(1,128,dtype=torch.bfloat16)
+p_int_add|torch.randint(0,10,(256,),dtype=torch.int32)+3
+p_int_mul|torch.randint(1,5,(1,128),dtype=torch.int32)*torch.randint(1,5,(1,128),dtype=torch.int32)
+p_3d_add|torch.randn(2,3,4)+torch.randn(2,3,4)
+p_bcast3|torch.randn(4,1,8)+torch.randn(1,5,8)
+p_where_gt|torch.where(torch.randn(1,256)>0,torch.randn(1,256),torch.randn(1,256))
+p_neg|torch.neg(torch.randn(1,128))
+p_square|torch.randn(1,128)**2
+p_affine|(torch.randn(1,256)*3.5)-1.25
+r_sum0_3d|torch.randn(2,4,8).sum(0)
+r_mean_last_odd|torch.randn(37,53).mean(-1)
+r_sum_keepdim|torch.randn(1,129).sum(-1,keepdim=True)
+r_max|torch.randn(1,256).max()
+r_prod|torch.randn(1,64).prod()
+m_100|torch.matmul(torch.randn(100,100),torch.randn(100,100))
+m_odd|torch.matmul(torch.randn(65,127),torch.randn(127,33))
+f_rmsnorm_eps|torch.nn.functional.rms_norm(torch.randn(2,3,256),(256,),1e-5)
+f_softmax_dim0|torch.softmax(torch.randn(4,16),dim=0)
+f_logsoftmax2|torch.log(torch.softmax(torch.randn(2,4,128),dim=-1))
+f_l2norm2|torch.randn(2,32,256)/torch.randn(2,32,256).norm(dim=-1,keepdim=True)
+f_sigmoid_mul|torch.sigmoid(torch.randn(1,1024))*torch.randn(1,1024)
+a_sdpa_causal|torch.nn.functional.scaled_dot_product_attention(torch.randn(1,2,64,64),torch.randn(1,2,64,64),torch.randn(1,2,64,64),is_causal=True)
+a_sdpa_scale|torch.nn.functional.scaled_dot_product_attention(torch.randn(1,4,48,32),torch.randn(1,4,48,32),torch.randn(1,4,48,32),scale=0.2)
