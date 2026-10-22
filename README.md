@@ -23,7 +23,11 @@ reduction tree are all decided. So this is a one-pass, one-statement-at-a-time t
 | `Tile` | cell id from `gid`, per-axis coordinates (row-major, last axis fastest), `gid >= ncells` guard |
 | `Load` / `Write` (width 1/2/4) | `ld.global.v4.f32` / `st.global.v2.f32`, or `.shared` forms |
 | `Assign` | one arithmetic instruction per operator; `dtype` comes from the IR, not from inference |
+| `Assign` producing a bool | held as a predicate (`setp`), never materialised as 0/1 |
+| comparison operators (`greater`, `less`, …) | `setp.{gt,lt,ge,le,eq,ne}.{f32,s32}` |
+| `Select` | one compare-and-branch chain; the last branch is the catch-all, matching the documented semantics |
 | `Accum` | `name = op(base, value)`, seeded with `op.identity` before the enclosing loop |
+| f16 / bf16 operands | memory traffic is 16-bit (`ld.b16` / `st.b16`), arithmetic stays f32 and narrows once at the store |
 | `WarpShuffle` | `shfl.sync.bfly.b32` butterfly over the reduction components |
 | `TreeHalve` | static unroll of `if tid < s { smem[tid] += smem[tid + s] }` + `bar.sync` |
 | `CpAsyncCopy` | `cp.async.cg.shared.global` (16 B) or `.ca` (4/8 B); destination = stripe base + lane offset |
