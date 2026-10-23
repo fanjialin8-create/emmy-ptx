@@ -161,6 +161,16 @@ class Emitter:
         # redundant-arithmetic elimination: value key -> register, register -> loop deps
         self.cse: dict[tuple, str] = {}
         self.dep: dict[str, frozenset[str]] = {}
+        # loop-invariant reuse: one cache per enclosing loop, plus the seq of the last
+        # register defined before that loop started
+        self.reg_seq: dict[str, int] = {}
+        self.seq_n: int = 0
+        self.mutated: set[str] = set()
+        self.loop_cache: list[dict] = []
+        self.loop_floor: list[int] = []
+        # registers known to be non-negative, and registers holding a known constant
+        self.nn: dict[str, bool] = {}
+        self.konst: dict[str, int] = {}
 
     # ---- register bank ---------------------------------------------------
     def emit(self, line: str) -> None:
@@ -258,18 +268,54 @@ class Emitter:
 
         if self._imm(a) is not None:  # a must be a register for the remaining ops
             a = self.force(a)
-        key = (op, a, b) if op not in ("add", "mul", "and", "or") else (op,) + tuple(sorted((str(a), str(b))))
+        # Reuse is only sound for values that cannot change inside the loop we are in: both
+        # operands must have been defined before this loop started and neither may be mutated
+        # in place (loop counters are).  Anything else is recomputed, because a cache that
+        # ignores this silent-miscompiles a GEMM.
+        key = (op,) + tuple(sorted((str(a), str(b)))) if op in ("add", "mul", "and", "or") else (op, a, b)
         hit = self.cse.get(key)
         if hit is not None:
             return hit
+        loop_key = None
+        if self.loop_cache and self.loop_floor and op in ("add", "sub", "mul", "div", "rem", "and", "or", "shl", "shr"):
+            floor = self.loop_floor[-1]
+            if self._invariant(a, floor) and self._invariant(b, floor):
+                loop_key = key
+                hit = self.loop_cache[-1].get(loop_key)
+                if hit is not None:
+                    return hit
         suffix = {"add": "add.s32", "sub": "sub.s32", "mul": "mul.lo.s32", "div": "div.s32",
                   "rem": "rem.s32", "and": "and.b32", "or": "or.b32",
                   "shl": "shl.b32", "shr": "shr.s32"}[op]
         out = self.p() if t == "pred" else self.r()
         self.emit(f"{suffix} {out}, {a}, {b};")
-        self.cse[key] = out
         self.dep[out] = self.deps(a) | self.deps(b)
+        self.seq_n += 1
+        self.reg_seq[out] = self.seq_n
+        self.cse[key] = out
+        if loop_key is not None and self.loop_cache:
+            self.loop_cache[-1][loop_key] = out
         return out
+
+    def _loop_enter(self, counter: str) -> None:
+        """Start an invariance scope: only values defined before here may be reused."""
+        self.loop_cache.append({})
+        self.loop_floor.append(self.seq_n + 1)
+        self.mutated.add(counter)
+
+    def _loop_exit(self) -> None:
+        self.loop_cache.pop()
+        self.loop_floor.pop()
+        # the back edge mutates the counter, so nothing cached inside the body survives it
+        self.cse.clear()
+
+    def _invariant(self, x, floor: int) -> bool:
+        """True when the value is loop-invariant for the loop whose entry seq is ``floor``."""
+        if self._imm(x) is not None:
+            return True
+        if x in self.mutated:
+            return False
+        return self.reg_seq.get(x, 1 << 30) < floor
 
     def force(self, x) -> str:
         """Materialise an immediate into a register (only when an instruction needs one)."""
@@ -591,9 +637,16 @@ class Emitter:
                 return [pr, "pred"]
             raise SystemExit(f"unsupported float binary op {op!r}")
         if op in EXPR_I:
-            out = self.r()
-            self.emit(f"{EXPR_I[op]} {out}, {lt[0]}, {rt[0]};")
-            return [out, "s32"]
+            aop = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "rem", "&": "and",
+                   "|": "or", "<<": "shl", ">>": "shr"}.get(op)
+            if aop is None:
+                out = self.r()
+                self.emit(f"{EXPR_I[op]} {out}, {lt[0]}, {rt[0]};")
+                return [out, "s32"]
+            r = self.arith(aop, lt[0], rt[0])
+            if self._imm(r) is not None:
+                r = self.force(r)
+            return [r, "s32"]
         aop = ARITH_OP.get(op)
         if aop is not None:
             r = self.arith(aop, lt[0], rt[0])
@@ -890,6 +943,11 @@ class Emitter:
         pr = self.p()
         self.emit(f"setp.lt.s32 {pr}, {self.gid}, {n_cells};")
         self.emit(f"@!{pr} bra {end_label};")
+        # Threads that fail the guard never execute anything below, so a cached expression is
+        # only reusable inside this region: keep the CSE scoped to it.
+        self.cse.clear()
+        if self.loop_cache:
+            self.loop_cache[-1].clear()
 
     # ---- statements ------------------------------------------------------
     def stmts(self, body) -> None:
@@ -1191,6 +1249,8 @@ class Emitter:
             self.emit(f"{other}:")
         # a value computed on one side of a branch is not computed on the other
         self.cse.clear()
+        if self.loop_cache:
+            self.loop_cache[-1].clear()
 
     def st_Select(self, st) -> None:
         """Coord-predicated value binding; the last branch is the catch-all."""
@@ -1216,6 +1276,8 @@ class Emitter:
         self.emit(f"{ends}:")
         self.syms[st.name] = [dst, dst_t]
         self.cse.clear()
+        if self.loop_cache:
+            self.loop_cache[-1].clear()
 
     def _flat(self, body) -> bool:
         """True when every statement is straight-line: no nested loop, branch or barrier.
@@ -1262,6 +1324,7 @@ class Emitter:
         cur = self.r()
         self.emit(f"mov.s32 {cur}, {start};")
         self.dep[cur] = frozenset({cur})
+        self._loop_enter(cur)
         self.emit(f"{top}:")
         lim = self.as_int(st.end if getattr(st, "end", None) is not None else st.axis.extent)
         pr = self.p()
@@ -1272,6 +1335,7 @@ class Emitter:
         step = self.as_int(st.step)
         # values that do not depend on the counter stay valid across the back edge
         self.prune({cur})
+        self._loop_exit()
         self.emit(f"add.s32 {cur}, {cur}, {step};")
         self.emit(f"bra {top};")
         self.emit(f"{end}:")
@@ -1291,6 +1355,7 @@ class Emitter:
         cur = self.r()
         self.emit(f"mov.s32 {cur}, 0;")
         self.dep[cur] = frozenset({cur})
+        self._loop_enter(cur)
         top = self.label("_top")
         self.emit(f"{top}:")
         lim = self.as_int(st.end if getattr(st, "end", None) is not None else st.axis.extent)
@@ -1300,6 +1365,7 @@ class Emitter:
         self.syms[st.axis.name] = [cur, "s32"]
         self.stmts(st.body)
         self.prune({cur})
+        self._loop_exit()
         self.emit(f"add.s32 {cur}, {cur}, 1;")
         self.emit(f"bra {top};")
         self.emit(f"{end}:")
@@ -1463,3 +1529,5 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+
+

@@ -69,22 +69,50 @@ All fifteen public problems pass, verified on both an RTX 4060 (`sm_89`, local) 
 ### Speed
 
 Measured on the RTX 4060 against Emmy's own CUDA for the same kernel (`tools/bench.py`, 300 iterations, same
-buffers, same grid and block). A ratio below 1.0 means faster than the nvcc-built reference:
+buffers, same grid and block, both binaries timed back to back in one process). A ratio below 1.0 means faster than
+the nvcc-built reference:
 
-| problem | before | after | vs Emmy's CUDA |
+| problem | mine | Emmy's CUDA | ratio |
 |---|---|---|---|
-| `p00_scalar_add` | 12.5 us | 12.4 us | 1.14x |
-| `r01_array_sum` | 11.0 us | 12.8 us | 0.79x |
-| `f02_row_softmax` | 17.7 us | 17.0 us | 0.41x |
-| `m01_matmul_512` | 1724 us | 993 us | 8.80x -> 5.06x |
-| `a01_attention` | 501 us | 497 us | 2.54x |
+| `p00_scalar_add` | 10.9 us | 11.5 us | **0.95x** |
+| `r01_array_sum` | 19.3 us | 22.1 us | **0.87x** |
+| `f02_row_softmax` | 26.6 us | 15.3 us | 1.74x |
+| `m01_matmul_512` | 141.4 us | 84.3 us | 1.68x |
+| `a01_attention` | 224.3 us | 86.9 us | 2.58x |
 
-On the official runner the same change takes `m01_matmul_512` from 116.9 us to 78.0 us. Absolute numbers on that
-shared machine drift by more than 2x between sessions, so only back-to-back runs are comparable there.
+That is the honest state: two kernels are faster than the reference, the rest are within 1.7–2.6x. Nothing here is
+a tuning trick aimed at one shape — every item is a property of the emitted code.
 
-The one lever that paid off was constant folding. Unrolling a straight-line inner loop makes the stage-rotation
-indices immediate, which drops dynamic `div`/`rem` from roughly 14k to 2k per thread. Repeated address arithmetic
-still goes through the emitter's small CSE, and that is where the remaining gap to nvcc lives: matmul is still 5x.
+`m01_matmul_512` shows the whole journey. It started 8.8x behind the reference: the GEMM inner loop recomputed a
+`div`/`rem` pair per load to work out which of the three `cp.async` stages a `k` belonged to, plus a `mul`/`add`/`sub`
+chain to turn tile coordinates into an address. Three changes removed almost all of it:
+
+1. **Unroll straight-line inner loops.** With the trip count as an immediate, every index expression in the body
+   folds at emission time and the arithmetic never reaches the GPU. Only bodies made of load/store/assign/accumulate
+   are unrolled: unrolling the attention body (which nests loops) silently changed the answer, and unrolling the
+   outer stage loop made the kernel 7x longer and 1.6x slower.
+2. **Keep integer constants as immediates** and fold through them, instead of materialising each one into a register
+   first. `add`, `mul`, `shl`, `and` all take an immediate operand, so `x + 0`, `x * 1`, `i / 1` and constant-only
+   expressions disappear at emission.
+3. **Reuse repeated address arithmetic** — but only where it is provably still valid: the cache is cleared at every
+   branch merge and at every loop back edge, and across a loop only values whose operands were all defined before
+   that loop started are reused.
+
+The PTX for `m01_matmul_512` goes from 4756 to 1891 lines, dynamic `div`/`rem` from 557 to 8, and the kernel from
+1724 us to 141 us locally — on the official runner, 116.9 us to 35.1 us.
+
+Step 3 is worth spelling out because the first attempt at it was wrong and the failure was silent: a cache that
+survived branch merges miscompiled `m02_matmul_rect` (max error 130, on the runner and locally), because a value is
+only valid where the thread state that produced it still holds. The kernel is now emitted with the cache cleared at
+every point where control can arrive from somewhere else; 100 differential tests and all fifteen problems pass on
+both architectures.
+
+Absolute numbers on the shared runner drift by more than 2x between sessions, so only back-to-back runs there are
+comparable.
+
+
+Absolute numbers on that shared machine drift by more than 2x between sessions, so only back-to-back runs are
+comparable there.
 
 ## Limits
 
