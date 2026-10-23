@@ -102,6 +102,23 @@ BINARY_I = {
     "minimum": "min.s32",
 }
 
+ARITH_OP = {
+    "+": "add",
+    "-": "sub",
+    "*": "mul",
+    "/": "div",
+    "%": "rem",
+    "&": "and",
+    "|": "or",
+    "<<": "shl",
+    ">>": "shr",
+    "add": "add",
+    "subtract": "sub",
+    "multiply": "mul",
+    "divide": "div",
+    "modulo": "rem",
+}
+
 UNARY_F = {
     "relu": None,  # handled specially: max(x, 0)
     "neg": "neg.f32",
@@ -141,6 +158,9 @@ class Emitter:
         self.smem: dict[str, tuple[tuple[int, ...], str, int]] = {}
         self.labels = 0
         self.params: list[tuple[str, str]] = []  # (name, dtype)
+        # redundant-arithmetic elimination: value key -> register, register -> loop deps
+        self.cse: dict[tuple, str] = {}
+        self.dep: dict[str, frozenset[str]] = {}
 
     # ---- register bank ---------------------------------------------------
     def emit(self, line: str) -> None:
@@ -170,6 +190,101 @@ class Emitter:
     def label(self, tag: str = "") -> str:
         self.labels += 1
         return f"L{self.labels}{tag}"
+
+    # ---- integer arithmetic: folding, immediates, common subexpressions ---
+    @staticmethod
+    def _imm(x) -> int | None:
+        """The integer value of an operand, or None if it lives in a register."""
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            return x
+        if isinstance(x, str):
+            try:
+                return int(x, 0)
+            except ValueError:
+                return None
+        return None
+
+    def deps(self, x) -> frozenset[str]:
+        return self.dep.get(x, frozenset()) if isinstance(x, str) else frozenset()
+
+    def prune(self, carried: set[str]) -> None:
+        """Drop cached values that depended on a loop counter (they change every iteration).
+
+        Values that do *not* depend on the counter survive the back edge: they were computed
+        once during the first iteration and their register still holds that value, which is
+        exactly loop-invariant code motion for free.
+        """
+        self.cse = {k: v for k, v in self.cse.items() if not (self.dep.get(v, frozenset()) & carried)}
+
+    def arith(self, op: str, a, b, t: str = "s32"):
+        """Emit one 32-bit integer op.  Returns a register name, or an int when folded."""
+        ia, ib = self._imm(a), self._imm(b)
+        if ia is not None and ib is not None:
+            folded = {
+                "add": lambda: ia + ib,
+                "sub": lambda: ia - ib,
+                "mul": lambda: ia * ib,
+                "div": (lambda: int(ia / ib)) if ib else None,
+                "rem": (lambda: ia - int(ia / ib) * ib) if ib else None,
+                "and": lambda: ia & ib,
+                "or": lambda: ia | ib,
+                "shl": lambda: ia << ib,
+                "shr": lambda: ia >> ib,
+            }.get(op)
+            if folded is not None:
+                return folded()
+        if op == "add":
+            if ia == 0:
+                return b
+            if ib == 0:
+                return a
+            if ia is not None:  # commutative: keep the immediate on the right
+                a, b = b, a
+        elif op == "mul":
+            if ia == 0 or ib == 0:
+                return 0
+            if ia == 1:
+                return b
+            if ib == 1:
+                return a
+            if ia is not None:
+                a, b = b, a
+        elif op == "sub" and ib == 0:
+            return a
+        elif op in ("div", "rem") and ib == 1:
+            return a if op == "div" else 0
+
+        if self._imm(a) is not None:  # a must be a register for the remaining ops
+            a = self.force(a)
+        key = (op, a, b) if op not in ("add", "mul", "and", "or") else (op,) + tuple(sorted((str(a), str(b))))
+        hit = self.cse.get(key)
+        if hit is not None:
+            return hit
+        suffix = {"add": "add.s32", "sub": "sub.s32", "mul": "mul.lo.s32", "div": "div.s32",
+                  "rem": "rem.s32", "and": "and.b32", "or": "or.b32",
+                  "shl": "shl.b32", "shr": "shr.s32"}[op]
+        out = self.p() if t == "pred" else self.r()
+        self.emit(f"{suffix} {out}, {a}, {b};")
+        self.cse[key] = out
+        self.dep[out] = self.deps(a) | self.deps(b)
+        return out
+
+    def force(self, x) -> str:
+        """Materialise an immediate into a register (only when an instruction needs one)."""
+        v = self._imm(x)
+        if v is None:
+            return x
+        key = ("const", v)
+        hit = self.cse.get(key)
+        if hit is not None:
+            return hit
+        out = self.r()
+        self.emit(f"mov.s32 {out}, {v};")
+        self.cse[key] = out
+        self.dep[out] = frozenset()
+        return out
 
     # ---- pool of registers for a dtype -----------------------------------
     def new_of(self, t: str) -> str:
@@ -289,6 +404,11 @@ class Emitter:
 
     # ---- address helpers -------------------------------------------------
     def as_int(self, e) -> str:
+        """An integer operand: an immediate when the expression is constant, else a register."""
+        if isinstance(e, int) and not isinstance(e, bool):
+            return str(e)
+        if type(e).__name__ == "Dim":
+            return str(dim_int(e))
         if isinstance(e, str):
             if e.startswith("%"):
                 return e
@@ -308,50 +428,75 @@ class Emitter:
             for i in range(1, len(parts)):
                 if shape[i] == 1 and i == len(parts) - 1:
                     continue
-                t = self.r()
-                self.emit(f"mul.lo.s32 {t}, {acc}, {shape[i]};")
-                acc2 = self.r()
-                self.emit(f"add.s32 {acc2}, {t}, {self.as_int(parts[i])};")
-                acc = acc2
+                acc = self.arith("mul", acc, shape[i])
+                acc = self.arith("add", acc, self.as_int(parts[i]))
             return acc
         if len(parts) == 1:
             return self.as_int(parts[0])
         # fall back: flat sum assuming the leading index is already linear
         acc = self.as_int(parts[0])
         for p in parts[1:]:
-            t = self.r()
-            self.emit(f"mul.lo.s32 {t}, {acc}, {shape[-1]};")
-            acc2 = self.r()
-            self.emit(f"add.s32 {acc2}, {t}, {self.as_int(p)};")
-            acc = acc2
+            acc = self.arith("mul", acc, shape[-1])
+            acc = self.arith("add", acc, self.as_int(p))
         return acc
 
     def byte_offset(self, lin: str, nbytes: int) -> str:
+        v = self._imm(lin)
+        if v is not None:
+            return str(v * nbytes)
+        if nbytes == 1:
+            return lin
+        key = ("widen", lin, nbytes)
+        hit = self.cse.get(key)
+        if hit is not None:
+            return hit
         off = self.rd()
         self.emit(f"mul.wide.s32 {off}, {lin}, {nbytes};")
+        self.cse[key] = off
+        self.dep[off] = self.deps(lin)
         return off
 
     def global_addr(self, buf: str, index) -> str:
         lin = self.linear(buf, index)
-        off = self.byte_offset(lin, dt_bytes_for(self.dtypes.get(buf, "f32")))
+        nbytes = dt_bytes_for(self.dtypes.get(buf, "f32"))
         base = self.addr_of_sym[buf]
+        v = self._imm(lin)
+        if v is not None:
+            if v == 0:
+                return base
+            key = ("gaddr", base, v * nbytes)
+            hit = self.cse.get(key)
+            if hit is not None:
+                return hit
+            a = self.rd()
+            self.emit(f"add.s64 {a}, {base}, {v * nbytes};")
+            self.cse[key] = a
+            self.dep[a] = frozenset()
+            return a
+        key = ("gaddr", base, lin, nbytes)
+        hit = self.cse.get(key)
+        if hit is not None:
+            return hit
         a = self.rd()
-        self.emit(f"add.s64 {a}, {base}, {off};")
+        if nbytes == 1:
+            off = self.byte_offset(lin, nbytes)
+            self.emit(f"add.s64 {a}, {base}, {off};")
+        else:
+            # one instruction: 64-bit address = 32-bit index * element size + base
+            self.emit(f"mad.wide.s32 {a}, {lin}, {nbytes}, {base};")
+        self.cse[key] = a
+        self.dep[a] = self.deps(lin)
         return a
 
     def shared_addr(self, buf: str, index) -> str:
         ext, t, _align = self.smem[buf]
         lin = self.linear(buf, index)
         nbytes = dt_bytes_for(t)
-        off = lin if nbytes == 1 else self.mul_const(lin, nbytes)
-        a = self.r()
-        self.emit(f"add.s32 {a}, {self.shared_base(buf)}, {off};")
-        return a
+        off = lin if nbytes == 1 else self.arith("mul", lin, nbytes)
+        return self.arith("add", self.shared_base(buf), off)
 
     def mul_const(self, reg: str, k: int) -> str:
-        out = self.r()
-        self.emit(f"mul.lo.s32 {out}, {reg}, {k};")
-        return out
+        return self.arith("mul", reg, k)
 
     def shared_base(self, buf: str) -> str:
         """32-bit shared-space base of a static shared symbol (like the worked example)."""
@@ -386,7 +531,7 @@ class Emitter:
         if cls == "FlatIndex":
             buf = getattr(e, "buffer", None)
             lin = self.linear(buf, e.index)
-            return [lin, "s32"]
+            return [lin if self._imm(lin) is None else self.force(lin), "s32"]
         if cls == "CastExpr":
             reg, t = self.expr(e.expr)
             want = dt_name(e.dtype)
@@ -413,8 +558,7 @@ class Emitter:
             bits = struct.unpack("<I", struct.pack("<f", float(v)))[0]
             self.emit(f"mov.b32 {reg}, 0f{bits:08X};")
             return [reg, FLOAT[t][0]]
-        reg = self.r()
-        self.emit(f"mov.s32 {reg}, {int(v)};")
+        reg = self.force(int(v))
         return [reg, "s32"]
 
     def is_float(self, t: str) -> bool:
@@ -450,6 +594,12 @@ class Emitter:
             out = self.r()
             self.emit(f"{EXPR_I[op]} {out}, {lt[0]}, {rt[0]};")
             return [out, "s32"]
+        aop = ARITH_OP.get(op)
+        if aop is not None:
+            r = self.arith(aop, lt[0], rt[0])
+            if self._imm(r) is not None:
+                r = self.force(r)
+            return [r, "s32"]
         if op in BINARY_I:
             out = self.r()
             self.emit(f"{BINARY_I[op]} {out}, {lt[0]}, {rt[0]};")
@@ -769,14 +919,9 @@ class Emitter:
             if i == len(axes) - 1:
                 reg = rest
             else:
-                q = self.r()
-                self.emit(f"div.s32 {q}, {rest}, {inner};")
-                m = self.r()
-                self.emit(f"mul.lo.s32 {m}, {q}, {inner};")
-                s = self.r()
-                self.emit(f"sub.s32 {s}, {rest}, {m};")
+                q = self.arith("div", rest, inner)
                 reg = q
-                rest = s
+                rest = self.arith("sub", rest, self.arith("mul", q, inner))
             self.syms[ax.name] = [reg, "s32"]
         self.stmts(st.body)
         self.emit(f"{end}:")
@@ -856,10 +1001,8 @@ class Emitter:
         if addr.startswith("%rd"):
             out = self.rd()
             self.emit(f"add.s64 {out}, {addr}, {delta};")
-        else:
-            out = self.r()
-            self.emit(f"add.s32 {out}, {addr}, {delta};")
-        return out
+            return out
+        return self.arith("add", addr, delta)
 
     def load_half(self, space: str, addr: str, t: str) -> str:
         rs = self.rs()
@@ -1014,16 +1157,9 @@ class Emitter:
         if lane is not None:
             cols = self.smem[st.smem][0][-1]
             l0, l1 = self.as_int(lane[0]), self.as_int(lane[1])
-            t = self.r()
-            self.emit(f"mul.lo.s32 {t}, {l0}, {cols};")
-            u = self.r()
-            self.emit(f"add.s32 {u}, {t}, {l1};")
-            v = self.r()
-            self.emit(f"add.s32 {v}, {lin}, {u};")
-            lin = v
+            lin = self.arith("add", lin, self.arith("add", self.arith("mul", l0, cols), l1))
         off = self.mul_const(lin, dt_bytes_for(self.smem[st.smem][1]))
-        saddr = self.r()
-        self.emit(f"add.s32 {saddr}, {self.shared_base(st.smem)}, {off};")
+        saddr = self.arith("add", self.shared_base(st.smem), off)
         gaddr = self.global_addr(st.src, st.src_index)
         nbytes = int(st.nbytes)
         if nbytes == 16:
@@ -1053,6 +1189,8 @@ class Emitter:
             self.emit(f"{end}:")
         else:
             self.emit(f"{other}:")
+        # a value computed on one side of a branch is not computed on the other
+        self.cse.clear()
 
     def st_Select(self, st) -> None:
         """Coord-predicated value binding; the last branch is the catch-all."""
@@ -1077,14 +1215,53 @@ class Emitter:
                 self.emit(f"bra {ends};")
         self.emit(f"{ends}:")
         self.syms[st.name] = [dst, dst_t]
+        self.cse.clear()
+
+    def _flat(self, body) -> bool:
+        """True when every statement is straight-line: no nested loop, branch or barrier.
+
+        Only such bodies are unrolled.  A loop that carries a nested loop unrolls into
+        thousands of live temporaries and ptxas then shuffles them badly, which is both
+        slower and (as measured on the attention kernel) numerically wrong.
+        """
+        allowed = {"Load", "Write", "Assign", "Accum", "Let", "Init", "CpAsyncCopy",
+                   "CpAsyncCommit", "CpAsyncWait"}
+        return all(type(s).__name__ in allowed for s in body)
+
+    def _trip(self, st):
+        """(first, step, count) when a strided loop has constant bounds, else None."""
+        try:
+            first = dim_int(st.start) if not isinstance(st.start, int) else st.start
+            step_i = dim_int(st.step) if not isinstance(st.step, int) else st.step
+            last = st.end if getattr(st, "end", None) is not None else st.axis.extent
+            last = dim_int(last) if not isinstance(last, int) else last
+        except Exception:
+            return None
+        if step_i <= 0 or last <= first:
+            return None
+        count = (last - first + step_i - 1) // step_i
+        if count <= 0:
+            return None
+        return first, step_i, count
 
     def st_StridedLoop(self, st) -> None:
         self.hoist_accums(st.body)
+        # A short constant-trip outer loop is worth unrolling: its counter feeds the
+        # shared-memory stage rotation, which then folds to a constant offset instead of
+        # running div/rem in the middle of the GEMM inner loop.
+        bounds = self._trip(st)
+        if bounds is not None and bounds[2] <= 1:  # outer unrolling measured slower: off
+            first, step_i, count = bounds
+            for i in range(count):
+                self.syms[st.axis.name] = [str(first + i * step_i), "s32"]
+                self.stmts(st.body)
+            return
         top = self.label("_top")
         end = self.label("_lend")
         start, _ = self.expr(st.start)
         cur = self.r()
         self.emit(f"mov.s32 {cur}, {start};")
+        self.dep[cur] = frozenset({cur})
         self.emit(f"{top}:")
         lim = self.as_int(st.end if getattr(st, "end", None) is not None else st.axis.extent)
         pr = self.p()
@@ -1093,15 +1270,27 @@ class Emitter:
         self.syms[st.axis.name] = [cur, "s32"]
         self.stmts(st.body)
         step = self.as_int(st.step)
+        # values that do not depend on the counter stay valid across the back edge
+        self.prune({cur})
         self.emit(f"add.s32 {cur}, {cur}, {step};")
         self.emit(f"bra {top};")
         self.emit(f"{end}:")
 
     def st_Loop(self, st) -> None:
         self.hoist_accums(st.body)
+        lim_v = st.end if getattr(st, "end", None) is not None else st.axis.extent
+        lim_i = dim_int(lim_v) if not isinstance(lim_v, int) else lim_v
+        if getattr(st, "unroll", False) and lim_i and 1 < lim_i <= 128 and self._flat(st.body):
+            # Unroll with the counter as an immediate: every index expression in the body
+            # folds to a constant, so the div/rem/mul chains never reach the GPU.
+            for i in range(lim_i):
+                self.syms[st.axis.name] = [str(i), "s32"]
+                self.stmts(st.body)
+            return
         end = self.label("_lend")
         cur = self.r()
         self.emit(f"mov.s32 {cur}, 0;")
+        self.dep[cur] = frozenset({cur})
         top = self.label("_top")
         self.emit(f"{top}:")
         lim = self.as_int(st.end if getattr(st, "end", None) is not None else st.axis.extent)
@@ -1110,6 +1299,7 @@ class Emitter:
         self.emit(f"@{pr} bra {end};")
         self.syms[st.axis.name] = [cur, "s32"]
         self.stmts(st.body)
+        self.prune({cur})
         self.emit(f"add.s32 {cur}, {cur}, 1;")
         self.emit(f"bra {top};")
         self.emit(f"{end}:")
@@ -1181,9 +1371,7 @@ class Emitter:
             self.syms[name] = [out, t]
 
     def plus(self, reg: str, k: int) -> str:
-        out = self.r()
-        self.emit(f"add.s32 {out}, {reg}, {k};")
-        return out
+        return self.arith("add", reg, k)
 
     # ---- program ---------------------------------------------------------
     def build(self, ir_path: str) -> dict:

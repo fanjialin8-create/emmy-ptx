@@ -66,6 +66,26 @@ how the corpus was grown beyond the fifteen public problems (`cases.txt`, 47 sha
 All fifteen public problems pass, verified on both an RTX 4060 (`sm_89`, local) and the official RTX 5090 runner
 (`sm_120`). Fused and attention problems are within 1e-5 relative; matmul within 1e-4.
 
+### Speed
+
+Measured on the RTX 4060 against Emmy's own CUDA for the same kernel (`tools/bench.py`, 300 iterations, same
+buffers, same grid and block). A ratio below 1.0 means faster than the nvcc-built reference:
+
+| problem | before | after | vs Emmy's CUDA |
+|---|---|---|---|
+| `p00_scalar_add` | 12.5 us | 12.4 us | 1.14x |
+| `r01_array_sum` | 11.0 us | 12.8 us | 0.79x |
+| `f02_row_softmax` | 17.7 us | 17.0 us | 0.41x |
+| `m01_matmul_512` | 1724 us | 993 us | 8.80x -> 5.06x |
+| `a01_attention` | 501 us | 497 us | 2.54x |
+
+On the official runner the same change takes `m01_matmul_512` from 116.9 us to 78.0 us. Absolute numbers on that
+shared machine drift by more than 2x between sessions, so only back-to-back runs are comparable there.
+
+The one lever that paid off was constant folding. Unrolling a straight-line inner loop makes the stage-rotation
+indices immediate, which drops dynamic `div`/`rem` from roughly 14k to 2k per thread. Repeated address arithmetic
+still goes through the emitter's small CSE, and that is where the remaining gap to nvcc lives: matmul is still 5x.
+
 ## Limits
 
 - Tensor-core, TMA and swizzled `cp.async` paths are not implemented. No public problem contains them, and the emitter
