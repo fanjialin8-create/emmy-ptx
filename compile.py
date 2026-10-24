@@ -9,6 +9,7 @@ downstream of that -- the PTX text -- is emitted here.
 from __future__ import annotations
 
 import json
+import os
 import struct
 import re
 import sys
@@ -1569,6 +1570,7 @@ class Emitter:
             "regs": (self.n_p, self.n_r, self.n_f, self.n_rd, self.n_rs),
             "pool": total > 48 * 1024,
             "prefix": self.prefix,
+            "block": (self.meta() or {}).get("block") or [],
         }
 
 
@@ -1589,7 +1591,15 @@ def shared_decls(built: list[dict]) -> list[str]:
 def entry_text(b: dict) -> list[str]:
     n_p, n_r, n_f, n_rd, n_rs = b["regs"]
     args = ",\n".join(f"\t.param .u64 p_{n}" for n, _t in b["params"])
-    out = [f".visible .entry {b['name']}(\n{args}\n)", "{"]
+    out = [f".visible .entry {b['name']}(\n{args}\n)"]
+    block = b.get("block") or []
+    if block and not os.environ.get("PTX_NO_MAXNTID"):
+        dims = [str(int(d)) for d in block] + ["1"] * (3 - len(block))
+        out.append(".maxntid " + ", ".join(dims[:3]))
+    cap = os.environ.get("PTX_MAXNREG")
+    if cap:
+        out.append(".maxnreg " + cap)
+    out.append("{")
     if n_p:
         out.append(f"\t.reg .pred %p<{n_p + 1}>;")
     if n_r:
