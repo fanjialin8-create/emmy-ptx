@@ -74,14 +74,15 @@ the nvcc-built reference:
 
 | problem | mine | Emmy's CUDA | ratio |
 |---|---|---|---|
-| `p00_scalar_add` | 10.9 us | 11.5 us | **0.95x** |
-| `r01_array_sum` | 19.3 us | 22.1 us | **0.87x** |
-| `f02_row_softmax` | 26.6 us | 15.3 us | 1.74x |
-| `m01_matmul_512` | 141.4 us | 84.3 us | 1.68x |
-| `a01_attention` | 224.3 us | 86.9 us | 2.58x |
+| `p00_scalar_add` | 23.9 us | 23.2 us | 1.03x |
+| `r01_array_sum` | 23.0 us | 23.9 us | **0.96x** |
+| `f02_row_softmax` | 8.85 us | 8.81 us | 1.00x |
+| `m01_matmul_512` | 124.7 us | 81.3 us | 1.53x |
+| `a01_attention` | 154.2 us | 80.2 us | 1.92x |
 
-That is the honest state: two kernels are faster than the reference, the rest are within 1.7–2.6x. Nothing here is
-a tuning trick aimed at one shape — every item is a property of the emitted code.
+That is the honest state: one kernel matches or beats the reference, the other four are within 1.0–1.9x. Nothing here
+is a tuning trick aimed at one shape — every item is a property of the emitted code, and the same three rewrites
+(constant folding, loop-invariant hoisting, multiply-add fusion) apply to every kernel the compiler emits.
 
 `m01_matmul_512` shows the whole journey. It started 8.8x behind the reference: the GEMM inner loop recomputed a
 `div`/`rem` pair per load to work out which of the three `cp.async` stages a `k` belonged to, plus a `mul`/`add`/`sub`
