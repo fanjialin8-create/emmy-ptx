@@ -377,8 +377,11 @@ class Emitter:
                 home = defs.get(reg)
                 if home is None or uses.get(reg) != 1:
                     continue
-                if any(ln2.endswith(":") for ln2 in self.body[home:i]):
-                    continue  # a branch label sits between them: not the same basic block
+                # A multiply sitting outside a loop still dominates uses inside it, but one
+                # inside a conditional does not dominate what follows the branch, so only the
+                # region-closing labels block the rewrite.
+                if any(ln2.endswith(("_else:", "_end:", "_endif:")) for ln2 in self.body[home:i]):
+                    continue
                 mk = MUL_RE.match(self.body[home])
                 width, _dst, lhs, imm = mk.group(1), mk.group(2), mk.group(3), mk.group(4)
                 if width != ("wide.s32" if ".s64" in ln else "lo.s32"):
