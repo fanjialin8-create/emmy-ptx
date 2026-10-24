@@ -84,6 +84,16 @@ That is the honest state: one kernel matches or beats the reference, the other f
 is a tuning trick aimed at one shape — every item is a property of the emitted code, and the same three rewrites
 (constant folding, loop-invariant hoisting, multiply-add fusion) apply to every kernel the compiler emits.
 
+Two things that look like wins and are not, both measured rather than assumed:
+
+- **Partially unrolling the remaining rolled loops** (the dot-product loops in the attention kernels, which emmy marks
+  `unroll=False` and nvcc unrolls anyway) is *twice as slow*: 165 us rolled versus 353 us at factor 2 and 351 us at
+  factor 4, repeatable across runs. Register use drops from 127 to 48 with no spills, so it is not register pressure —
+  each unrolled copy recomputes its own address chain, and the extra address arithmetic costs more than the loop
+  closure saves.
+- **Capping registers** with `.maxnreg` for occupancy loses as well: 96 registers takes the attention kernel from
+  1.83x to 2.54x behind the reference. The kernels want their registers.
+
 `m01_matmul_512` shows the whole journey. It started 8.8x behind the reference: the GEMM inner loop recomputed a
 `div`/`rem` pair per load to work out which of the three `cp.async` stages a `k` belonged to, plus a `mul`/`add`/`sub`
 chain to turn tile coordinates into an address. Three changes removed almost all of it:
