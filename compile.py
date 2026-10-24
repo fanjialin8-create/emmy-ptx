@@ -19,6 +19,8 @@ from emmy.compiler.graph import Graph
 # --------------------------------------------------------------------------
 # dtypes
 
+MUL_RE = re.compile(r"^\tmul\.(lo\.s32|wide\.s32)\s+(%[a-z]+\d+),\s*(%[a-z]+\d+),\s*(-?\d+);")
+ADD_RE = re.compile(r"^\t(add\.s32|add\.s64)\s+(%[a-z]+\d+),\s*(%[a-z]+\d+),\s*(%[a-z]+\d+);")
 DEST_RE = re.compile(r"^\t[\w.]+\s+(%[a-z]+\d+)\s*,")
 SRC_RE = re.compile(r"%[a-z]+\d+")
 
@@ -346,6 +348,47 @@ class Emitter:
                 continue
             return False
         return True
+
+    def _fuse_madd(self) -> None:
+        """Rewrite ``t = a * k`` + ``d = t + b`` as ``mad d, a, k, b`` when ``t`` has one use.
+
+        Both forms are exact for 32-bit wraparound, so this only removes an instruction; the
+        temporary has to be single-use or the rewrite would duplicate work.
+        """
+        uses: dict[str, int] = {}
+        defs: dict[str, int] = {}
+        for i, ln in enumerate(self.body):
+            hit = MUL_RE.match(ln)
+            if hit is not None:
+                defs[hit.group(2)] = i
+            regs = SRC_RE.findall(ln)
+            head = DEST_RE.match(ln)
+            if head is not None and regs and regs[0] == head.group(1):
+                regs = regs[1:]  # its own destination is a definition, not a use
+            for reg in regs:
+                uses[reg] = uses.get(reg, 0) + 1
+        dead: set[int] = set()
+        for i, ln in enumerate(self.body):
+            hit = ADD_RE.match(ln)
+            if hit is None:
+                continue
+            dst, srcs = hit.group(2), hit.groups()[2:]
+            for j, reg in enumerate(srcs):
+                home = defs.get(reg)
+                if home is None or uses.get(reg) != 1:
+                    continue
+                mk = MUL_RE.match(self.body[home])
+                width, _dst, lhs, imm = mk.group(1), mk.group(2), mk.group(3), mk.group(4)
+                if width != ("wide.s32" if ".s64" in ln else "lo.s32"):
+                    continue
+                other = srcs[1 - j]
+                if other == reg:
+                    continue
+                self.body[i] = f"\tmad.{width} {dst}, {lhs}, {imm}, {other};"
+                dead.add(home)
+                break
+        if dead:
+            self.body = [ln for i, ln in enumerate(self.body) if i not in dead]
 
     def _apply_lifts(self) -> None:
         """Apply every lift, largest body index first so earlier indices stay valid."""
@@ -1510,6 +1553,7 @@ class Emitter:
         self.prologue()
         self.stmts(self.op.body)
         self._apply_lifts()
+        self._fuse_madd()
         layout, total = self.smem_layout()
         return {
             "name": self.op.name,
