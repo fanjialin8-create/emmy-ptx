@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import struct
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,9 @@ from emmy.compiler.graph import Graph
 
 # --------------------------------------------------------------------------
 # dtypes
+
+DEST_RE = re.compile(r"^\t[\w.]+\s+(%[a-z]+\d+)\s*,")
+SRC_RE = re.compile(r"%[a-z]+\d+")
 
 FLOAT = {"f16": ("f16", 2), "f32": ("f32", 4), "f64": ("f64", 8), "bf16": ("bf16", 2)}
 INT = {"int": ("s32", 4), "i32": ("s32", 4), "i64": ("s64", 8), "u32": ("u32", 4), "u64": ("u64", 8)}
@@ -168,6 +172,11 @@ class Emitter:
         self.mutated: set[str] = set()
         self.loop_cache: list[dict] = []
         self.loop_floor: list[int] = []
+        # per-loop stack of body indices holding arithmetic that can move in front of the loop,
+        # and the finished (header index, indices) lifts waiting to be applied
+        self.hoist: list[list[tuple[int, str]]] = []
+        self.lifts: list[tuple[int, list[int]]] = []
+        self.defined: dict[str, int] = {}
         # registers known to be non-negative, and registers holding a known constant
         self.nn: dict[str, bool] = {}
         self.konst: dict[str, int] = {}
@@ -175,6 +184,9 @@ class Emitter:
     # ---- register bank ---------------------------------------------------
     def emit(self, line: str) -> None:
         self.body.append(line if line.endswith(":") else "\t" + line)
+        hit = DEST_RE.match(self.body[-1])
+        if hit is not None:
+            self.defined[hit.group(1)] = len(self.body) - 1
 
     def r(self) -> str:
         self.n_r += 1
@@ -295,13 +307,56 @@ class Emitter:
         self.cse[key] = out
         if loop_key is not None and self.loop_cache:
             self.loop_cache[-1][loop_key] = out
+        if self.hoist:
+            self.hoist[-1].append((len(self.body) - 1, out))
         return out
 
     def _loop_enter(self, counter: str) -> None:
         """Start an invariance scope: only values defined before here may be reused."""
         self.loop_cache.append({})
         self.loop_floor.append(self.seq_n + 1)
+        self.hoist.append([])
         self.mutated.add(counter)
+
+    def _hoist_out(self, mark: int) -> None:
+        """Queue the counter-independent arithmetic recorded since ``mark`` for lifting.
+
+        ``dep`` records which loop counters a value was built from, so an empty set means the
+        value cannot change while this loop runs.  Deciding that at the end - rather than while
+        the body is being emitted - lets a constant that was itself lifted make its consumers
+        liftable too.
+        """
+        scope = self.hoist.pop()
+        cand = {i: reg for i, reg in scope if not self.dep.get(reg)}
+        lifted: set[int] = set()
+        for i, reg in sorted(cand.items()):
+            if self._operands_live(i, mark, lifted):
+                lifted.add(i)
+        if lifted:
+            self.lifts.append((mark, sorted(lifted)))
+
+    def _operands_live(self, index: int, mark: int, lifted: set) -> bool:
+        """True when every source register of ``self.body[index]`` is available at ``mark``."""
+        srcs = SRC_RE.findall(self.body[index])
+        for s in srcs[1:] if srcs else []:
+            home = self.defined.get(s)
+            if home is None:
+                return False  # defined by a non-arithmetic emitter: leave it alone
+            if home < mark or home in lifted:
+                continue
+            return False
+        return True
+
+    def _apply_lifts(self) -> None:
+        """Apply every lift, largest body index first so earlier indices stay valid."""
+        if not self.lifts:
+            return
+        for mark, idxs in sorted(self.lifts, key=lambda item: -item[0]):
+            lifted = [self.body[i] for i in idxs]
+            drop = set(idxs)
+            self.body = [ln for i, ln in enumerate(self.body) if i not in drop]
+            self.body[mark:mark] = lifted
+        self.lifts.clear()
 
     def _loop_exit(self) -> None:
         self.loop_cache.pop()
@@ -330,6 +385,10 @@ class Emitter:
         self.emit(f"mov.s32 {out}, {v};")
         self.cse[key] = out
         self.dep[out] = frozenset()
+        self.seq_n += 1
+        self.reg_seq[out] = self.seq_n
+        if self.hoist:
+            self.hoist[-1].append((len(self.body) - 1, out))
         return out
 
     # ---- pool of registers for a dtype -----------------------------------
@@ -1325,6 +1384,7 @@ class Emitter:
         self.emit(f"mov.s32 {cur}, {start};")
         self.dep[cur] = frozenset({cur})
         self._loop_enter(cur)
+        mark = len(self.body)
         self.emit(f"{top}:")
         lim = self.as_int(st.end if getattr(st, "end", None) is not None else st.axis.extent)
         pr = self.p()
@@ -1336,6 +1396,7 @@ class Emitter:
         # values that do not depend on the counter stay valid across the back edge
         self.prune({cur})
         self._loop_exit()
+        self._hoist_out(mark)
         self.emit(f"add.s32 {cur}, {cur}, {step};")
         self.emit(f"bra {top};")
         self.emit(f"{end}:")
@@ -1356,6 +1417,7 @@ class Emitter:
         self.emit(f"mov.s32 {cur}, 0;")
         self.dep[cur] = frozenset({cur})
         self._loop_enter(cur)
+        mark = len(self.body)
         top = self.label("_top")
         self.emit(f"{top}:")
         lim = self.as_int(st.end if getattr(st, "end", None) is not None else st.axis.extent)
@@ -1366,6 +1428,7 @@ class Emitter:
         self.stmts(st.body)
         self.prune({cur})
         self._loop_exit()
+        self._hoist_out(mark)
         self.emit(f"add.s32 {cur}, {cur}, 1;")
         self.emit(f"bra {top};")
         self.emit(f"{end}:")
@@ -1446,6 +1509,7 @@ class Emitter:
         self.prepare()
         self.prologue()
         self.stmts(self.op.body)
+        self._apply_lifts()
         layout, total = self.smem_layout()
         return {
             "name": self.op.name,
