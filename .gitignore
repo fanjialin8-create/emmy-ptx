@@ -3,3 +3,7 @@ __pycache__/
 .localrun/
 *.cubin
 *.ptx
+
+# the submission video is a download, not source
+*.mp4
+
