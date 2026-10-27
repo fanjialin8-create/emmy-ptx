@@ -1,0 +1,4 @@
+r_cumsum|torch.cumsum(torch.randn(1,128),dim=-1)
+r_cumsum2d|torch.cumsum(torch.randn(4,64),dim=-1)
+a_mask|torch.nn.functional.scaled_dot_product_attention(torch.randn(1,2,16,32),torch.randn(1,2,16,32),torch.randn(1,2,16,32),attn_mask=torch.zeros(16,16,dtype=torch.bool))
+p_boolin|torch.where(torch.randn(1,64)>0,torch.randn(1,64),torch.zeros(1,64))

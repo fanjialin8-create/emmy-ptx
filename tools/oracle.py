@@ -121,7 +121,9 @@ def nvrtc_ptx(source: str, arch: str = "compute_89") -> str:
 
 # ---------------------------------------------------------------- launching
 
-NP_OF = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i64": np.int64, "u32": np.uint32}
+NP_OF = {"f32": np.float32, "f16": np.float16, "bf16": np.float32, "f64": np.float64,
+         "i32": np.int32, "i64": np.int64, "u32": np.uint32,
+         "bool": np.bool_, "bool8": np.bool_, "i1": np.bool_, "u8": np.uint8, "i8": np.int8}
 
 
 def launch(cubin: bytes, entry: str, grid, block, smem: int, arrays: list[np.ndarray]) -> None:

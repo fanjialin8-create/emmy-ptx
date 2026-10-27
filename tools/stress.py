@@ -1,4 +1,4 @@
-﻿"""Hidden-set stress test: diff our PTX against emmy's own CUDA codegen.
+"""Hidden-set stress test: diff our PTX against emmy's own CUDA codegen.
 
 For every expression we ask emmy for a kernel-stage IR (our input) plus the CUDA
 source it would have compiled itself (reference oracle), then run both on the
@@ -70,16 +70,19 @@ def run_case(name: str, expr: str) -> tuple[str, str]:
     if not ir_path.exists():
         return "DUMP-FAIL", (r.stdout + r.stderr).strip().splitlines()[-1][:300]
 
-    plan = json.loads((dump / "10_lowering_cuda.json").read_text())
+    plan_path = dump / "10_lowering_cuda.json"
+    if not plan_path.exists():
+        return "DUMP-FAIL", "no cuda plan: " + last_line((r.stdout + r.stderr).strip()[-400:])
+    plan = json.loads(plan_path.read_text())
     cuda = [n for n in plan["nodes"].values() if n["op"] == "CudaOp"]
-    if len(cuda) != 1:
-        return "MULTI-KERNEL", f"{len(cuda)} kernels: " + ",".join(n["op_fields"]["kernel_name"] for n in cuda)
+    if not cuda:
+        return "NO-KERNEL", "no CudaOp in the plan"
 
-    pf = cuda[0]["op_fields"]
     ir = json.loads(ir_path.read_text())
     facts = O.graph_facts(ir_path)
     outputs = set(ir["outputs"])
-    missing = [a for a in pf["arg_order"] if a not in facts]
+    plans = [n["op_fields"] for n in cuda]
+    missing = sorted({a for p in plans for a in p["arg_order"] if a not in facts})
     if missing:
         return "NO-FACTS", "unknown args " + ",".join(missing)
 
@@ -87,26 +90,38 @@ def run_case(name: str, expr: str) -> tuple[str, str]:
         mine = O.assemble(my_ptx(ir_path), WORK / f"{name}.mine.cubin")
     except RuntimeError as exc:
         return "PTX-FAIL", last_line(str(exc))
-    try:
-        ref = O.assemble(O.nvrtc_ptx(pf["kernel_source"]), WORK / f"{name}.ref.cubin")
-    except RuntimeError as exc:
-        return "REF-FAIL", last_line(str(exc))
 
-    entry = pf["kernel_name"]
-    grid, block, smem = dims3(pf["grid"]), dims3(pf["block"]), int(pf["smem_bytes"])
-    a_mine = O.make_args(pf["arg_order"], facts, outputs)
-    a_ref = [x.copy() for x in a_mine]
+    refs = []
+    for i, pf in enumerate(plans):
+        try:
+            refs.append(O.assemble(O.nvrtc_ptx(pf["kernel_source"]), WORK / f"{name}.ref{i}.cubin"))
+        except RuntimeError as exc:
+            return "REF-FAIL", last_line(str(exc))
+
+    # One buffer per name, shared by every kernel in the plan: the kernels chain through memory.
+    names = sorted({a for p in plans for a in p["arg_order"]})
+    pool_mine = dict(zip(names, O.make_args(names, facts, outputs)))
+    pool_ref = {k: v.copy() for k, v in pool_mine.items()}
+
     try:
-        O.launch(mine, entry, grid, block, smem, a_mine)
-        O.launch(ref, entry, grid, block, smem, a_ref)
+        for pf, ref in zip(plans, refs):
+            order = pf["arg_order"]
+            for zeroed in pf.get("zero_outputs") or []:
+                if zeroed in pool_mine:
+                    pool_mine[zeroed][...] = 0
+                    pool_ref[zeroed][...] = 0
+            grid, block, smem = dims3(pf["grid"]), dims3(pf["block"]), int(pf["smem_bytes"])
+            O.launch(mine, pf["kernel_name"], grid, block, smem, [pool_mine[a] for a in order])
+            O.launch(ref, pf["kernel_name"], grid, block, smem, [pool_ref[a] for a in order])
     except RuntimeError as exc:
         return "RUN-FAIL", last_line(str(exc))
 
     worst, detail = 0.0, []
-    for nm, mine_arr, ref_arr in zip(pf["arg_order"], a_mine, a_ref):
+    for nm in names:
         if nm not in outputs:
             continue
-        a, b = np.asarray(mine_arr, dtype=np.float64), np.asarray(ref_arr, dtype=np.float64)
+        a = np.asarray(pool_mine[nm], dtype=np.float64)
+        b = np.asarray(pool_ref[nm], dtype=np.float64)
         if a.shape != b.shape:
             return "SHAPE", f"{nm}: {a.shape} vs {b.shape}"
         if a.size == 0:
@@ -116,7 +131,8 @@ def run_case(name: str, expr: str) -> tuple[str, str]:
         worst = max(worst, rel)
         detail.append(f"{nm}: max_rel={rel:.3e}")
     ok = worst < 5e-3
-    return ("PASS" if ok else "MISMATCH"), f"worst_rel={worst:.3e} " + " ".join(detail)
+    tag = "" if len(plans) == 1 else f"[{len(plans)} kernels] "
+    return ("PASS" if ok else "MISMATCH"), tag + f"worst_rel={worst:.3e} " + " ".join(detail)
 
 
 def main() -> int:

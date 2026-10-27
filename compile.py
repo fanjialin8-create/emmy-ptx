@@ -39,12 +39,17 @@ def dt_name(dt) -> str:
     }.get(n, n)
 
 
+BOOL = {"bool": ("pred", 1), "bool8": ("pred", 1), "i1": ("pred", 1), "u8": ("u8", 1), "i8": ("s8", 1)}
+
+
 def dt_bytes(dt) -> int:
     n = dt_name(dt)
     if n in FLOAT:
         return FLOAT[n][1]
     if n in INT:
         return INT[n][1]
+    if n in BOOL:
+        return BOOL[n][1]
     raise SystemExit(f"unsupported dtype {n!r}")
 
 
@@ -105,8 +110,18 @@ BINARY_I = {
     "multiply": "mul.lo.s32",
     "divide": "div.s32",
     "modulo": "rem.s32",
+    "remainder": "rem.s32",
+    "fmod": "rem.s32",
     "maximum": "max.s32",
     "minimum": "min.s32",
+    "bitwise_and": "and.b32",
+    "bitwise_or": "or.b32",
+    "bitwise_xor": "xor.b32",
+    "and": "and.b32",
+    "or": "or.b32",
+    "xor": "xor.b32",
+    "left_shift": "shl.b32",
+    "right_shift": "shr.s32",
 }
 
 ARITH_OP = {
@@ -155,7 +170,7 @@ class Emitter:
         self.node = kernel_node
         self.op = kernel_node.op
         self.prefix = prefix  # namespaces module-level shared symbols in multi-kernel modules
-        self.n_r = self.n_f = self.n_p = self.n_rd = self.n_rs = 0
+        self.n_r = self.n_f = self.n_p = self.n_rd = self.n_rs = self.n_fd = 0
         self.body: list[str] = []
         self.syms: dict[str, list[str]] = {}  # name -> [reg, ptx type]
         self.ptr: dict[str, str] = {}  # buffer -> u64 base register
@@ -211,6 +226,11 @@ class Emitter:
         """16-bit register: half/bfloat16 values travel through it on the way to and from memory."""
         self.n_rs += 1
         return f"%rs{self.n_rs}"
+
+    def fd(self) -> str:
+        """64-bit register: only ``ld.f64``/``st.f64``/``cvt`` touch it, around f32 arithmetic."""
+        self.n_fd += 1
+        return f"%fd{self.n_fd}"
 
     def label(self, tag: str = "") -> str:
         self.labels += 1
@@ -444,7 +464,7 @@ class Emitter:
     def new_of(self, t: str) -> str:
         if t in ("f16", "f32", "f64", "bf16"):
             return self.f()
-        if t in ("s32", "u32"):
+        if t in ("s32", "u32", "bool", "bool8", "u8", "i8"):
             return self.r()
         if t in ("s64", "u64"):
             return self.rd()
@@ -632,12 +652,9 @@ class Emitter:
         if hit is not None:
             return hit
         a = self.rd()
-        if nbytes == 1:
-            off = self.byte_offset(lin, nbytes)
-            self.emit(f"add.s64 {a}, {base}, {off};")
-        else:
-            # one instruction: 64-bit address = 32-bit index * element size + base
-            self.emit(f"mad.wide.s32 {a}, {lin}, {nbytes}, {base};")
+        # one instruction for every element width, including one-byte masks: a 32-bit
+        # index in a register cannot be added to a 64-bit base directly
+        self.emit(f"mad.wide.s32 {a}, {lin}, {nbytes}, {base};")
         self.cse[key] = a
         self.dep[a] = self.deps(lin)
         return a
@@ -789,6 +806,10 @@ class Emitter:
     def cast(self, reg: str, have: str, want: str) -> str:
         if have == want:
             return reg
+        # one-byte values live in ordinary 32-bit registers, so widening is free;
+        # a predicate target is handled by the boolean branch below, not here
+        if have in ("u8", "i8", "bool", "bool8") and want != "pred":
+            have = "s32"
         # a predicate bound to a bool-typed SSA name stays a predicate: every consumer
         # (``where``/``Select``/``Cond``) wants it that way, and materialising 0/1 would
         # only add a selp per use.
@@ -809,6 +830,17 @@ class Emitter:
         if have in ("s32", "u32") and want in ("s32", "u32", "s64", "u64"):
             out = self.new_of(want)
             self.emit(f"cvt.{want}.{have} {out}, {reg};")
+            return out
+        # Mixed integer/float arithmetic happens whenever a literal is typed float but
+        # compared against an integer buffer (``x > 4.0`` with ``x`` int32), which the
+        # frontend emits routinely; widen or narrow instead of giving up.
+        if self.is_float(have) and want in ("s32", "u32", "s64", "u64"):
+            out = self.new_of(want)
+            self.emit(f"cvt.rzi.{want}.f32 {out}, {reg};")
+            return out
+        if have in ("s32", "u32") and self.is_float(want):
+            out = self.new_of(want)
+            self.emit(f"cvt.rn.{want}.{have} {out}, {reg};")
             return out
         raise SystemExit(f"unsupported cast {have} -> {want}")
 
@@ -863,11 +895,33 @@ class Emitter:
                 out = self.r()
                 self.emit(f"{BINARY_I[name]} {out}, {args[0][0]}, {args[1][0]};")
                 return [out, "s32"]
+            if len(args) == 1:
+                unary_i = {"negative": "neg.s32", "neg": "neg.s32", "absolute": "abs.s32",
+                           "abs": "abs.s32", "bitwise_not": "not.b32", "invert": "not.b32"}
+                if name in unary_i:
+                    out = self.r()
+                    self.emit(f"{unary_i[name]} {out}, {args[0][0]};")
+                    return [out, "s32"]
+                if name in ("copy", "bitcast", "positive"):
+                    return [args[0][0], t]
+            if name == "where" and len(args) == 3:
+                cond = args[0][0] if args[0][1] == "pred" else self._pred(args[0][0], args[0][1])
+                out = self.r()
+                self.emit(f"selp.b32 {out}, {args[1][0]}, {args[2][0]}, {cond};")
+                return [out, "s32"]
+            if name == "square" and len(args) == 1:
+                out = self.r()
+                self.emit(f"mul.lo.s32 {out}, {args[0][0]}, {args[0][0]};")
+                return [out, "s32"]
             raise SystemExit(f"unsupported int elementwise {name!r}")
         a = [x[0] for x in args]
         if name in BINARY_F and len(a) == 2:
             out = self.f()
-            self.emit(f"{BINARY_F[name]} {out}, {a[0]}, {a[1]};")
+            # a mask or an integer buffer can meet a float operand here; unify to the
+            # operand type that the arithmetic is actually done in
+            left = a[0] if self.is_float(args[0][1]) else self.as_type(args[0], t)
+            right = a[1] if self.is_float(args[1][1]) else self.as_type(args[1], t)
+            self.emit(f"{BINARY_F[name]} {out}, {left}, {right};")
             return [out, t]
         if name == "relu" and len(a) == 1:
             return [self._bin("max.f32", a[0], self._const(0.0)), t]
@@ -897,6 +951,14 @@ class Emitter:
                 "gelu_tanh": self._gelu_tanh,
                 "erf": self._erf,
                 "sign": self._sign,
+                "square": lambda x: self._bin("mul.f32", x, x),
+                "positive": lambda x: x,
+                "log1p": lambda x: self._bin("mul.f32", self._lg2(self._bin("add.f32", x, self._const(1.0))), self._const(LN2)),
+                "expm1": lambda x: self._bin("sub.f32", self._exp(x), self._const(1.0)),
+                "sinh": lambda x: self._bin("mul.f32", self._const(0.5),
+                                            self._bin("sub.f32", self._exp(x), self._exp(self._bin("mul.f32", x, self._const(-1.0))))),
+                "cosh": lambda x: self._bin("mul.f32", self._const(0.5),
+                                            self._bin("add.f32", self._exp(x), self._exp(self._bin("mul.f32", x, self._const(-1.0))))),
             }.get(name)
             if one is not None:
                 return [one(a[0]), t]
@@ -908,6 +970,8 @@ class Emitter:
                 "remainder": self._fmod,
                 "fmod": self._fmod,
                 "floor_divide": self._floor_div,
+                "hypot": lambda x, y: self._bin("sqrt.rn.f32", self._bin("add.f32", self._bin("mul.f32", x, x),
+                                                                         self._bin("mul.f32", y, y))),
             }.get(name)
             if two is not None:
                 return [two(a[0], a[1]), t]
@@ -1103,6 +1167,8 @@ class Emitter:
         else:
             t = self.dtypes.get(buf, "f32")
         ptx_t = FLOAT[t][0] if t in FLOAT else (INT[t][0] if t in INT else t)
+        if ptx_t in ("bool", "bool8", "i1", "pred"):
+            ptx_t = "u8"  # one byte on the way in; a predicate only once it is compared
         shared = buf in self.smem
         if shared:
             addr = self.shared_addr(buf, st.index)
@@ -1113,6 +1179,17 @@ class Emitter:
             # every value we compute with is f32; 16-bit storage is widened on the way in
             for i, nm in enumerate(names):
                 self.syms[nm] = [self.load_half(space, self.step(addr, i * 2), t), "f32"]
+            return
+        if ptx_t == "f64":
+            # f64 buffers are narrowed to f32 while the value is in a register: the
+            # arithmetic paths, the comparison paths and the constant formats are all
+            # f32, and a hidden variant that touches a double buffer should still run.
+            for i, nm in enumerate(names):
+                fd = self.fd()
+                self.emit(f"ld.{space}.f64 {fd}, [{self.step(addr, i * 8)}];")
+                out = self.f()
+                self.emit(f"cvt.rn.f32.f64 {out}, {fd};")
+                self.syms[nm] = [out, "f32"]
             return
         if n == 1:
             out = self.new_of(ptx_t)
@@ -1272,6 +1349,8 @@ class Emitter:
         n = len(values)
         t = dt_name(st.value_dtype)
         ptx_t = FLOAT[t][0] if t in FLOAT else (INT[t][0] if t in INT else t)
+        if ptx_t in ("bool", "bool8", "i1", "pred"):
+            ptx_t = "u8"
         regs = [self.syms[v][0] for v in values]
         shared = out in self.smem
         addr = self.shared_addr(out, st.index) if shared else self.global_addr(out, st.index)
@@ -1281,6 +1360,14 @@ class Emitter:
                 raise SystemExit("atomic 16-bit write unsupported")
             for i, reg in enumerate(regs):
                 self.store_half(space, self.step(addr, i * 2), reg, t)
+            return
+        if ptx_t == "f64":
+            if getattr(st, "atomic", False):
+                raise SystemExit("atomic 64-bit write unsupported")
+            for i, reg in enumerate(regs):
+                fd = self.fd()
+                self.emit(f"cvt.f64.f32 {fd}, {reg};")
+                self.emit(f"st.{space}.f64 [{self.step(addr, i * 8)}], {fd};")
             return
         if getattr(st, "atomic", False):
             if n != 1:
@@ -1310,6 +1397,54 @@ class Emitter:
             self.emit(f"bar.sync {bid}, {count};")
         else:
             self.emit(f"bar.sync {bid};")
+
+    def st_ZeroPrologue(self, st) -> None:
+        """Delegated zero-init: the whole grid zeroes a stride of another kernel's accumulator.
+
+        The statement exists so the runtime does not have to memset between launches: this kernel
+        launches before the one that accumulates into ``dst``, so stream order makes the zero
+        happen first. Every thread writes every ``gridDim * blockDim``-th 32-bit word, which is
+        why the whole grid has to participate.
+        """
+        dst = getattr(st, "dst", None)
+        words = int(getattr(st, "words", 0) or 0)
+        if dst is None or dst not in self.addr_of_sym:
+            raise SystemExit(f"zero-prologue target {dst!r} is not a kernel parameter")
+        if words <= 0:
+            return
+        base = self.addr_of_sym[dst]
+
+        def sp(sym: str) -> str:
+            out = self.r()
+            self.emit(f"mov.u32 {out}, {sym};")
+            return out
+
+        nx, ny, nz = sp("%ntid.x"), sp("%ntid.y"), sp("%ntid.z")
+        tx, ty, tz = sp("%tid.x"), sp("%tid.y"), sp("%tid.z")
+        cx, cy, cz = sp("%ctaid.x"), sp("%ctaid.y"), sp("%ctaid.z")
+        gx, gy, gz = sp("%nctaid.x"), sp("%nctaid.y"), sp("%nctaid.z")
+
+        threads = self.arith("mul", self.arith("mul", nx, ny), nz, "u32")
+        thread = self.arith("add", tx, self.arith("mul", nx, self.arith("add", ty, self.arith("mul", ny, tz, "u32"), "u32"), "u32"), "u32")
+        block = self.arith("add", cx, self.arith("mul", gx, self.arith("add", cy, self.arith("mul", gy, cz, "u32"), "u32"), "u32"), "u32")
+        grid = self.arith("mul", gx, self.arith("mul", gy, gz, "u32"), "u32")
+        stride = self.arith("mul", threads, grid, "u32")
+        first = self.arith("add", self.arith("mul", self.force(block), self.force(threads), "u32"), self.force(thread), "u32")
+
+        i = self.force(first)
+        top, end = self.label("_zptop"), self.label("_zpend")
+        self.emit(f"{top}:")
+        done = self.p()
+        self.emit(f"setp.ge.u32 {done}, {i}, {words};")
+        self.emit(f"@{done} bra {end};")
+        off = self.rd()
+        self.emit(f"mul.wide.u32 {off}, {i}, 4;")
+        at = self.rd()
+        self.emit(f"add.s64 {at}, {base}, {off};")
+        self.emit(f"st.global.u32 [{at}], 0;")
+        self.emit(f"add.u32 {i}, {i}, {stride};")
+        self.emit(f"bra {top};")
+        self.emit(f"{end}:")
 
     def st_CpAsyncCopy(self, st) -> None:
         swz = str(getattr(st, "swizzle", "NONE") or "NONE")
@@ -1493,20 +1628,44 @@ class Emitter:
         states = tuple(st.state)
         others = tuple(getattr(st, "state_b", ()) or ())
         length = int(getattr(st, "length", 32) or 32)
-        off = length // 2
-        while off >= 1:
+        prefix = bool(getattr(st, "prefix", False))
+        off = 1 if prefix else length // 2
+        while off < length if prefix else off >= 1:
             bindings = []
             for i, name in enumerate(states):
                 acc, t = self.syms[name]
                 tmp = self.r()
                 got = self.r()
                 other = self.new_of(t)
+                pr = self.p()
                 self.emit(f"mov.b32 {tmp}, {acc};")
-                self.emit(f"shfl.sync.bfly.b32 {got}|{self.p()}, {tmp}, {off}, 0x1f, 0xffffffff;")
-                self.emit(f"mov.b32 {other}, {got};")
+                if prefix:
+                    # An inclusive scan, not an all-reduce: lane i takes lane i-off.
+                    # Lanes below the segment get the identity so the combine below can
+                    # stay unconditional, exactly like the reduce path.
+                    self.emit(f"shfl.sync.up.b32 {got}|{pr}, {tmp}, {off}, 0x0, 0xffffffff;")
+                    zero = "0f00000000" if self.is_float(t) else "0"
+                    self.emit(f"selp.b32 {other}, {got}, {zero}, {pr};")
+                else:
+                    self.emit(f"shfl.sync.bfly.b32 {got}|{pr}, {tmp}, {off}, 0x1f, 0xffffffff;")
+                    self.emit(f"mov.b32 {other}, {got};")
                 bindings.append((others[i] if i < len(others) else f"{name}__o", other, t))
             self.merge(st, bindings)
-            off //= 2
+            off = off * 2 if prefix else off // 2
+
+    def st_WarpBroadcast(self, st) -> None:
+        """``x = __shfl_sync(mask, x, length - 1, length)``: last lane of each group, in place."""
+        length = int(getattr(st, "length", 32) or 32)
+        last = length - 1
+        for name in tuple(st.state):
+            acc, t = self.syms[name]
+            tmp = self.r()
+            got = self.r()
+            out = self.new_of(t)
+            self.emit(f"mov.b32 {tmp}, {acc};")
+            self.emit(f"shfl.sync.idx.b32 {got}|{self.p()}, {tmp}, {last}, {last}, 0xffffffff;")
+            self.emit(f"mov.b32 {out}, {got};")
+            self.syms[name] = [out, t]
 
     def st_TreeHalve(self, st) -> None:
         bufs = tuple(getattr(st, "bufs", ()))
@@ -1567,7 +1726,7 @@ class Emitter:
             "body": list(self.body),
             "layout": layout,
             "total": total,
-            "regs": (self.n_p, self.n_r, self.n_f, self.n_rd, self.n_rs),
+            "regs": (self.n_p, self.n_r, self.n_f, self.n_rd, self.n_rs, self.n_fd),
             "pool": total > 48 * 1024,
             "prefix": self.prefix,
             "block": (self.meta() or {}).get("block") or [],
@@ -1589,7 +1748,7 @@ def shared_decls(built: list[dict]) -> list[str]:
 
 
 def entry_text(b: dict) -> list[str]:
-    n_p, n_r, n_f, n_rd, n_rs = b["regs"]
+    n_p, n_r, n_f, n_rd, n_rs, n_fd = b["regs"]
     args = ",\n".join(f"\t.param .u64 p_{n}" for n, _t in b["params"])
     out = [f".visible .entry {b['name']}(\n{args}\n)"]
     block = b.get("block") or []
@@ -1610,6 +1769,8 @@ def entry_text(b: dict) -> list[str]:
         out.append(f"\t.reg .b64 %rd<{n_rd + 1}>;")
     if n_rs:
         out.append(f"\t.reg .b16 %rs<{n_rs + 1}>;")
+    if n_fd:
+        out.append(f"\t.reg .b64 %fd<{n_fd + 1}>;")
     out.extend(b["body"])
     out.append("\tret;")
     out.append("}")
@@ -1633,6 +1794,8 @@ def dt_bytes_for(t: str) -> int:
         return FLOAT[t][1]
     if t in INT:
         return INT[t][1]
+    if t in BOOL:
+        return BOOL[t][1]
     raise SystemExit(f"unknown dtype {t!r}")
 
 

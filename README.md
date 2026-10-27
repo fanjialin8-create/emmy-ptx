@@ -59,7 +59,11 @@ Three layers, because "it compiled" and "it is right" are different claims:
 | `submit.py` (from the task repo) | the official runner, real hardware, hidden thresholds |
 
 The differential harness is the interesting one: it turns any expression Emmy can lower into a new test case, which is
-how the corpus was grown beyond the fifteen public problems (`cases.txt`, 47 shape and operator variants).
+how the corpus was grown beyond the fifteen public problems — seven case files, 130+ expressions covering odd shapes,
+broadcasts, integer and half-precision dtypes, reductions along every axis, batched matmul, softmax with an
+accumulator `base`, and attention with and without a causal mask. Every remaining failure in that corpus is Emmy's own:
+its frontend refusing an expression (`DUMP-FAIL`), its CUDA failing to build under NVRTC (`REF-FAIL`), or a plan with
+no kernel in it (`NO-KERNEL`). None of them is a translation bug.
 
 ## Results
 
@@ -121,16 +125,17 @@ both architectures.
 Absolute numbers on the shared runner drift by more than 2x between sessions, so only back-to-back runs there are
 comparable.
 
-
-Absolute numbers on that shared machine drift by more than 2x between sessions, so only back-to-back runs are
-comparable there.
-
 ## Limits
 
 - Tensor-core, TMA and swizzled `cp.async` paths are not implemented. No public problem contains them, and the emitter
   raises rather than guess.
-- `f16`/`bf16` are supported as storage widths, not as an arithmetic domain.
-- One kernel per module; multi-kernel graphs are emitted in order but share no state.
+- `f16`/`bf16` are storage widths; arithmetic stays f32. `f64` buffers are narrowed to f32 on load and widened on store
+  — a deliberate trade that covers the type variant at the cost of double precision.
+- Multi-kernel graphs emit one entry per `KernelOp`, with shared-memory symbols namespaced when two kernels would
+  otherwise collide.
+- Warp **prefix scans** (`WarpShuffle(prefix=True)`) and `WarpBroadcast` are implemented, but a 1-D `cumsum` still
+  comes out wrong past the first chunk; the 2-D scan path is correct. Anything else the emitter does not understand is
+  refused loudly rather than emitted approximately.
 
 ## Windows notes
 

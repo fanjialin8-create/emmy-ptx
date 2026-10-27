@@ -1,0 +1,4 @@
+p_f64|torch.randn(1,64,dtype=torch.float64)+1.0
+p_f64mul|torch.randn(2,32,dtype=torch.float64)*2.5
+r_f64sum|torch.randn(1,128,dtype=torch.float64).sum(-1)
+p_f64cast|torch.randn(1,32,dtype=torch.float64).float()+1.0
